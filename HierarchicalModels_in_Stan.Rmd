@@ -1,0 +1,334 @@
+---
+title: "Hierarchical Models in Stan"
+author: "Kelly"
+date: "3/24/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(knitr)
+hook_output <- knit_hooks$get("output")
+knit_hooks$set(output = function(x, options) {
+  lines <- options$output.lines
+  if (is.null(lines)) {
+    return(hook_output(x, options))  # pass to default hook
+  }
+  x <- unlist(strsplit(x, "\n"))
+  more <- "..."
+  if (length(lines)==1) {        # first n lines
+    if (length(x) > lines) {
+      # truncate the output, but add ....
+      x <- c(head(x, lines), more)
+    }
+  } else {
+    x <- c(more, x[lines], more)
+  }
+  # paste these lines together
+  x <- paste(c(x, ""), collapse = "\n")
+  hook_output(x, options)
+})  #function to suppress long output of code. See https://community.rstudio.com/t/showing-only-the-first-few-lines-of-the-results-of-a-code-chunk/6963/2
+
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warnings = FALSE)
+
+library(rethinking)
+library(rstanarm)
+library(tidyverse)
+library(bayesplot)
+library(here)
+
+setwd(here())
+
+```
+
+## What's a Hierarchical Model?
+
+When you have a dataset that has some underlying structure -- for example, perhaps you have collected many samples at different sites -- there's a good chance you would benefit from a **hierarchical model** (also called a **multilevel** model). That is, instead of lumping all data together into a single pool, you treat different parts of your dataset (somewhat) separately. This allows you to let (for example) the effect of sunlight on growth vary across your collection sites. 
+
+This is also referred to as `**mixed-effects modeling**', because it allows you to specify that some model parameters apply across all samples (*fixed* effects) and some apply particularly to subsets of samples (*random* effects; the slope of sunlight vs. growth in the above example).
+
+
+# Stan
+
+![](stan_logo.png)
+
+We're going to use Stan (https://mc-stan.org/) for Bayesian analysis of the question, and will compare three different interfaces for Stan itself. See http://mc-stan.org/rstanarm/articles/glmer.html#comparison-with-lme4, and http://mc-stan.org/rstanarm/articles/pooling.html, in particular. 
+
+  - The `rethinking` package comes with ulam(), a reasonably friendly way to generate Stan code
+  - The `rstanarm` package, which has pre-compiled Stan code you access by calling functions analogous to lm()
+  - Direct coding of a Stan input file, for comparison
+
+## The dataset
+
+Following McElreath's Statistical Rethinking book, we'll use the UC Berkeley admissions dataset. 
+
+See ?UCBAdmissions:
+
+"This data set is frequently used for illustrating Simpson's paradox, see Bickel et al (1975). At issue is whether the data show evidence of sex bias in admission practices. There were 2691 male applicants, of whom 1198 (44.5%) were admitted, compared with 1835 female applicants of whom 557 (30.4%) were admitted. This gives a sample odds ratio of 1.83, indicating that males were almost twice as likely to be admitted. In fact, graphical methods (as in the example below) or log-linear modelling show that the apparent association between admission and sex stems from differences in the tendency of males and females to apply to the individual departments (females used to apply more to departments with higher rejection rates).
+
+Bickel, P. J., Hammel, E. A., and O'Connell, J. W. (1975). Sex bias in graduate admissions: Data from Berkeley. Science, 187, 398–403. http://www.jstor.org/stable/1739581.
+"
+
+Because this is about admissions -- that is, a process in which an applicant is either admitted or not -- we model it as a binomial process. The research question is: is there evidence of sex-bias in admissions here?
+
+```{r}
+# prep data; from Statistical Rethinking
+  data( UCBadmit )
+  UCBadmit$male <- as.integer(UCBadmit$applicant.gender=="male")
+  UCBadmit$dept <- rep( 1:6 , each=2 )
+  UCBadmit$applicant.gender <- NULL
+```
+
+
+# A Naïve First Look
+
+Lumping all the data together, it seems that males (`male = 1`) were admitted at a higher rate than those not identifying as males (`male = 0`).
+
+```{r}
+UCBadmit %>% 
+  group_by(male) %>% 
+  summarise(admit = sum(admit),
+            applications = sum(applications)) %>% 
+  mutate(rate = admit / applications,
+         male = as.factor(male))
+```
+
+But there's clearly something else going on: breaking this down by department, we see a different pattern. There's no general trend across departments. 
+
+```{r}
+UCBadmit %>% 
+  mutate(rate = admit / applications,
+         male = as.factor(male)) %>% 
+  ggplot(aes(x = dept, y = rate, color = male)) +
+    geom_point(size = 2) +
+    ylab("Admissions Rate")
+
+
+UCBadmit %>% 
+  mutate(rate = admit / applications,
+         male = as.factor(male)) %>% 
+  ggplot(aes(x = male, y = rate, color = male)) +
+    geom_violin() +
+    geom_jitter(height = 0, width = 0.1) +
+    ylab("Admissions Rate")
+
+```
+
+So, can we quantify this? Is there ANY general evidence of sex-biased admissions?
+
+Here's where hierarchical models come in: our dataset is structured, with admissions happening within departments.  
+
+# Always Look at Your Data a Lot 
+
+Models aren't magic, and neither are computers. They can only do what you ask them to do. And the more thought you put into your design -- the more you see a model as a test of an idea -- the better-off you'll be. So look back at the plots above, and consider what you want to know. Are there other models you might want to build? Other possible explanations for the patterns you see in the data? Etc. 
+
+# Model with Variable Intercepts and a Single Slope
+
+We're treating admissions as a binomial process, so:
+
+$Nadmitted \sim Binomial(Napplications, ProbAdmission)$
+
+But because admissions happen within departments, we're going to have separate admissions rates for each department. These will be our Intercept Parameters
+
+AND because we want to know whether there's an effect of sex, we are going test that hypothesis explicitly: if there's an effect of sex on admissions, the "slope" parameter will be non-zero. [For what it's worth, as my friend Ole points out, the effect of Sex isn't really a slope parameter, because the variable takes on discrete levels (0,1 or male/female). Hence, I'm putting "slope" in quotation marks, but we'll still call it a slope, because it illustrates the point we're making: it's the effect of sex on admissions probability.]
+
+So we'll model $ProbAdmission = Intercept[DepartmentSpecific] + Slope * Sex$
+
+## Using Ulam()
+
+The `ulam()` function from the `rethinking` package generates underlying Stan code for your model, compiles it in C++, and runs it.  This takes a while, but is reasonably friendly. This example is from the 2nd edition of Statistical Rethinking. [And another note here from Ole. Stan uses a version of Markov Chain Monte Carlo (MCMC) to sample the probability distribution of model parameters. I think of most statistical problems in two parts, 1) what is the model I want? and 2) how do I estimate it?  MCMC is clearly the later... but not the only way to do this.]
+
+```{r, output.lines=10}
+m_glmm1 <- ulam(
+  alist(
+    admit ~ binomial(applications,p),  #just as we set it up, above: number of admits is a draw from the number of applications with probability p of success
+    logit(p) <- a[dept] + b*male,      #and here's how we model p ; as above, with department-specific intercept and a single slope.  The logit() is a transform to get it to fall between 0 and 1, as probabilities must. 
+    a[dept] ~ normal( abar , sigma ),  #this is a Bayesian prior; we're drawing values of intercepts from a normal distribution ... 
+    abar ~ normal( 0 , 4 ),     #... and the parameters of that normal distribution are this mean
+    sigma ~ half_normal(0,1),   #... and this variance
+    b ~ normal(0,1)             #and here's the prior for our slope parameter
+  ), 
+  data=UCBadmit,                #this is the dataset itself
+  chains =4                     #this is the number of indep chains the algorithm is sampling from
+  )                
+
+precis(m_glmm1, depth = 2)  #here's how to look at the result
+postcheck(m_glmm1)          #here's a quick graphical way to compare the posteriors to the observed admissions rates
+
+#note: you can see the Stan code this generates using stancode(m_glmm1)
+#note also: parameter values are logit-transformed, and need to be transformed back to make intuitive sense
+#e.g.
+#plogis(-.1)
+```
+
+This model suggests our slope -- the overall effect of sex, across all departments -- is very slightly negative, but the 95% CI includes zero, so in some sense it's not significantly different from zero. 
+
+## Using rstanarm()
+
+We can do the same thing with a different interface to Stan, with `rstanarm`.  This doesn't require compiling, so is faster. But it uses a different syntax. 
+
+```{r, output.lines=10}
+#make sure we're treating the appropriate variables as factors, not integers
+UCBadmit2 <- UCBadmit %>% 
+    mutate(dept = as.factor(dept),
+           male = as.factor(male)) 
+
+rstanarm_variableIntercept <- stan_glmer(
+  cbind(admit, reject) ~ male + (1 | dept), #this syntax is not intuitive to me. the response variable is two columns: admits and rejections, and here we specify that we want a single slope (for `male`) and a variable intercept that varies by department (`dept`). This syntax is the same as for the `lmer` package (see https://stats.stackexchange.com/questions/13166/rs-lmer-cheat-sheet) 
+#### OLE: This syntax always messes with me too. Again I think it's easier to interpret as intercepts because male and dept are both factors / offsets.  (1| factor) means randomness around the intercept with realizations for each level determined by factor.
+  
+  data = UCBadmit2,  #dataset
+  family = binomial(link = "logit")  #since glmer is a general-purpose function, it doesn't necessarily know we're trying to do a binomial model, so we have to tell it. 
+  )
+
+summary(rstanarm_variableIntercept)
+```
+
+We can compare these to the `ulam()` results; they are very similar. So that's nice. 
+
+```{r}
+#compare to m_glmm1 ; they agree!
+m_glmm1@stanfit
+coefficients(rstanarm_variableIntercept)
+
+# and compare predicted to observed data
+posterior_predict(rstanarm_variableIntercept) %>% 
+  mcmc_intervals() +
+  xlab("N admitted") +
+  geom_point(data = UCBadmit2, aes(x = admit, y = 12:1), color = "red") #add observed data in red
+
+```
+
+
+# Stan Code Itself
+
+Of course, the most hardcore way of using Stan is to code the input file yourself. This is also the best way to make sure you know what you're doing. But it is another language to learn. 
+
+Here, we'll cheat for now, annotate the code generated by `ulam()`, and use that. We need to write out a file to the computer in order to use it to run Stan. This then gets compiled in C++, the model run, and then read into **R**. It's just a plaintext file, so you can write your own in a text editor, or in Rstudio, etc.  
+
+```{r, output.lines=10}
+VariableInterceptSingleSlope <- 
+"data{
+    int reject[12];          //setting up the input data, so Stan knows what to expect. here, integer vector called `reject`, which is 12 values long. The other parts of the data block are the same.
+    int applications[12];
+    int admit[12];
+    int male[12];
+    int dept[12];
+}
+parameters{
+    vector[6] a;             //similarly, expressly setting up the model parameters to estimate
+    real abar;
+    real<lower=0> sigma;
+    real b;
+}
+model{
+    vector[12] p;
+    b ~ normal( 0 , 1 );       //prior for the slope
+    sigma ~ normal( 0 , 1 );   //prior for the variance of distrib for intercepts. Note that a variance can't be zero, and so here a half-normal distribution is specified by constraining the parameter sigma (in the `parameters` block) not to go below zero.
+    abar ~ normal( 0 , 4 );    //prior for the mean of distrib for intercepts
+    a ~ normal( abar , sigma );  //prior for the distribution of intercepts
+    for ( i in 1:12 ) {     // for each set of observations, use a and b to estimate probability of admission
+        p[i] = a[dept[i]] + b * male[i];
+        p[i] = inv_logit(p[i]);
+    }
+    admit ~ binomial( applications , p );  //finally, infer probability of admission, given data
+}
+"
+
+#write out to file
+write.table(VariableInterceptSingleSlope, "VariableInterceptSingleSlope.stan", row.names = F, quote = F, col.names = F)
+
+#then read in and run Stan
+model_varInt <- stan(file = "VariableInterceptSingleSlope.stan", 
+                     data = UCBadmit,  #note here: it wants integers, not factors, for key variables
+                     chains = 4,   #number of chains
+                     iter = 4000   #number of iterations per chain
+       )
+```
+
+```{r, output.lines=10}
+#here again, the model results are the same, which of course they should be
+summary(model_varInt)$summary
+
+#as with the earlier versions, we can look at the posterior densities for individual parameters -- here, the slope parameter for sex. 
+mcmc_areas(model_varInt, pars = "b")
+
+```
+
+And why would you want to use Stan code? Well, apart from making sure you know what your computer is doing, it also offers the ability to create downstream "generated quantities".  For example, suppose you wanted to use your estimated parameters to project admissions in a hypothetical admissions class for some future year.  You could use Stan's generated quantities block (not illustrated in the example above, because we didn't use it) to derive predictions and credibility intervals for those predictions. Which is pretty cool.   
+
+# Model with Variable Intercepts and Variable Slopes
+
+OK, so it seems like the department-level variation in baseline admission rate (i.e., the intercept) explains a lot. But we can also let the slope (here, effect of sex on admissions rate) vary with department. The cost is estimating a lot more parameters, but it turns out to be worthwhile. 
+
+## Using Ulam
+
+This is now a lot more complicated, because the department-level slope and intercept parameters aren't independent of one another... they come from the same departments, after all. This means the code is less straightforward. But the result is intelligible. 
+
+```{r, output.lines=10}
+m_glmm2 <- ulam(
+  alist(
+    admit ~ binomial(applications,p),
+    logit(p) <- a[dept] + b[dept]*male,
+    c( a , b )[dept] ~ multi_normal( c(abar,bbar) , Rho , sigma ),
+    abar ~ normal( 0 , 4 ),
+    bbar ~ normal(0,1),
+    sigma ~ half_normal(0,1),
+    Rho ~ lkjcorr(2)
+  ),
+  data=UCBadmit,
+  chains = 4)
+```
+
+
+## Using rstanarm 
+
+```{r, output.lines=10}
+  #adapted from  http://mc-stan.org/rstanarm/articles/pooling.html
+  SEED <- 101
+  wi_prior <- normal(-1, 1)  # weakly informative prior on log-odds
+  
+ rstanarm_variableSlopeIntercept <- stan_glmer(
+  cbind(admit, reject) ~ (1 + male | dept), #a different slope and intercept for each dept and male/nonmale
+           data = UCBadmit2, 
+           family = binomial("logit"),
+           prior_intercept = wi_prior, 
+  seed = SEED)
+  
+  #compare to m_glmm2; they also agree!
+m_glmm2@stanfit
+coefficients(rstanarm_variableSlopeIntercept)
+
+```
+
+Now compare predicted to observed data...
+
+```{r, output.lines=10}
+posterior_predict(rstanarm_variableSlopeIntercept) %>% 
+  mcmc_intervals() +
+  geom_point(data = UCBadmit2, aes(x = admit, y = 12:1), color = "red") #add observed data in red
+```
+
+
+## Stan Code Itself
+
+I'm not going to pretend I can code this myself yet, because of the complications of correlations among parameters (and thus, the requirement for a correlation matrix). 
+
+So I will just put the output of `stancode()` for the `ulam()` object above, and you can check it out.
+
+```{r}
+stancode(m_glmm2)
+```
+
+
+# Conclusion
+
+And finally... is there evidence of sex-biased admissions?  Not on the whole, and really only in one department (Department 1), and in that case, maleness works against applicants, rather than for them. 
+
+```{r}
+mcmc_intervals(rstanarm_variableSlopeIntercept,
+               regex_pars = "male1")
+```
+
+
