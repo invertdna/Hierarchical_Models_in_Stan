@@ -59,9 +59,9 @@ We're going to use Stan (https://mc-stan.org/) for Bayesian analysis of the ques
   - The `rstanarm` package, which has pre-compiled Stan code you access by calling functions analogous to lm()
   - Direct coding of a Stan input file, for comparison
 
-## The dataset
+## The first dataset
 
-Following McElreath's Statistical Rethinking book, we'll use the UC Berkeley admissions dataset. 
+Following McElreath's Statistical Rethinking book, we'll first use the UC Berkeley admissions dataset. 
 
 See ?UCBAdmissions:
 
@@ -70,7 +70,7 @@ See ?UCBAdmissions:
 Bickel, P. J., Hammel, E. A., and O'Connell, J. W. (1975). Sex bias in graduate admissions: Data from Berkeley. Science, 187, 398–403. http://www.jstor.org/stable/1739581.
 "
 
-Because this is about admissions -- that is, a process in which an applicant is either admitted or not -- we model it as a binomial process. The research question is: is there evidence of sex-bias in admissions here?
+Because this is about admissions -- that is, a process in which an applicant is either admitted or not -- we model it as a *binomial* process. The research question is: is there evidence of sex-bias in admissions here?
 
 ```{r}
 # prep data; from Statistical Rethinking
@@ -330,5 +330,116 @@ And finally... is there evidence of sex-biased admissions?  Not on the whole, an
 mcmc_intervals(rstanarm_variableSlopeIntercept,
                regex_pars = "male1")
 ```
+
+
+
+
+
+
+# A second example: CO2 uptake in Plants
+
+To do a linear-regression example, we'll look at the built-in CO2 uptake dataset. 
+
+From the helpfile: "The CO2 data frame has 84 rows and 5 columns of data from an experiment on the cold tolerance of the grass species *Echinochloa crus-galli*."
+
+
+```{r}
+
+#looking creating a data subset we can model with a linear regression
+plants <- datasets::CO2 %>% 
+  filter(conc < 500) %>%    #just take the lower part of the curve
+  mutate(conc = log(conc))  #log-transform concentration
+  
+#take a look at the data:
+  plants %>% 
+  ggplot(aes(y = uptake, x = conc, color = Treatment)) +
+    geom_point() + 
+    geom_smooth(method = "lm") +
+    facet_grid(~Type)
+
+```
+
+So, it looks likely that there is a differential effect of plant type (Quebec vs. Mississippi) and of treatment (chilled vs. nonchilled) on CO2 uptake in these plants. 
+
+The research question is then: do the slopes vary for each of these data subsets? 
+
+We can guess that the intercept of these models will be the same for all treatments and all types, because when CO2 concentration is zero, uptake must be zero.  
+
+So we want a model that allows slope to vary by both plant type and treatment, but keeps a single intercept. 
+
+We'll do this one with `rstanarm`.  
+
+```{r, output.lines=10}
+varSlope <- stan_glmer(uptake ~ (0+conc|Type/Treatment), #noting here that each plant Type has different Treatment levels... that is, they are nested.  See https://stats.stackexchange.com/questions/13166/rs-lmer-cheat-sheet and https://rpsychologist.com/r-guide-longitudinal-lme-lmer
+           data = plants,
+           family = "gaussian",
+           prior = normal(0, 20),
+           prior_intercept = normal(0, 10),
+           chains = 4)
+
+```
+
+
+```{r}
+#for a very quick/dirty view, just look at posterior means
+plants$modelPrediction1 <- 
+  posterior_predict(varSlope) %>% 
+  colMeans()
+
+plants %>% 
+  ggplot(aes(y = uptake, x = conc, color = Treatment)) +
+    geom_point() + 
+    geom_smooth(method = "lm", se = F) +
+    geom_point(aes(y = modelPrediction1, x = conc), color = "black") +
+    geom_smooth(aes(y = modelPrediction1, x = conc), method = "lm", se = F, linetype = "dashed") +
+    facet_grid(~Type)
+
+```
+
+This model does a pretty good job, but from the graph, it looks like we want to do another one, letting the intercepts vary, and see if that helps the fit. 
+
+```{r, output.lines=10}
+varSlopeInt <- stan_glmer(uptake ~ (1+conc|Type/Treatment), 
+           data = plants,
+           family = "gaussian",
+           prior = normal(0, 5),
+           prior_intercept = normal(0, 50),
+           chains = 4)
+```
+
+Still not a perfect fit, but a bit better overall.  
+
+```{r}
+#for a very quick/dirty view, just look at posterior means
+plants$modelPrediction2 <- 
+  posterior_predict(varSlopeInt) %>% 
+  colMeans()
+
+plants %>% 
+  ggplot(aes(y = uptake, x = conc, color = Treatment)) +
+    geom_point() + 
+    geom_smooth(method = "lm", se = F) +
+    geom_point(aes(y = modelPrediction2, x = conc), color = "black") +
+    geom_smooth(aes(y = modelPrediction2, x = conc), method = "lm", se = F, linetype = "dashed") +
+    facet_grid(~Type)
+
+```
+
+Do model comparison, to see if the gain is worth it.
+
+```{r}
+loo_compare(
+  waic(varSlope),
+  waic(varSlopeInt)
+)
+
+```
+
+The second model is way better (i.e., is far more probable to minimize information loss), and so we'll use that one. 
+
+
+
+
+
 
 
