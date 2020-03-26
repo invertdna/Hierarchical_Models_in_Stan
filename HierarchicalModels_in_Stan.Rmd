@@ -407,7 +407,7 @@ varSlopeInt <- stan_glmer(uptake ~ (1+conc|Type/Treatment),
            chains = 4)
 ```
 
-Still not a perfect fit, but a bit better overall.  
+Still not a perfect fit. Mississippi Chilled doesn't want to behave very well. But a bit better overall. 
 
 ```{r}
 #for a very quick/dirty view, just look at posterior means
@@ -438,8 +438,29 @@ loo_compare(
 The second model is way better (i.e., is far more probable to minimize information loss), and so we'll use that one. 
 
 
+## Conclusion to Part 2
+
+So, do the different plant types and treatments respond differently to different CO2 concentrations? 
+
+Looking at the slope parameters:
+
+```{r}
+mcmc_intervals(varSlopeInt,
+           regex_pars = "b\\[conc")
+
+```
+
+1. Type matters more than Treatment, and 
+2. Within a Type, Treatment matters slightly more for Mississippi than for Quebec.
+
+You can quantify this conclusion by comparing the different slope parameters:
+
+```{r}
+summary(varSlopeInt)
+```
 
 
+By this analysis, it seems Type is a significant effect, but Treatment isn't really. 
 
 
 
